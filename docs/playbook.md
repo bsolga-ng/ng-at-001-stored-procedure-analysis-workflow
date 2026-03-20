@@ -230,13 +230,93 @@ Commit + PR
 
 ---
 
+## Level 2: SQL Server MCP Integration
+
+> **If the `microsoft-sql` MCP server is enabled**, Claude Code can query the database directly — replacing most PowerShell bridge scripts with live queries. This is the recommended setup when MCP is available.
+
+### What MCP Replaces
+
+| PowerShell Script | MCP Equivalent | Still Needed? |
+|-------------------|----------------|---------------|
+| `Export-SpDefinitions.ps1` | Claude Code queries `OBJECT_DEFINITION()` directly | **No** — MCP replaces entirely |
+| `Export-SpMetadata.ps1` | Claude Code queries `sys.parameters`, `sys.sql_expression_dependencies`, `sys.indexes` | **No** — MCP replaces entirely |
+| `Get-SpStats.ps1` | Claude Code queries `sys.dm_exec_procedure_stats` | **No** — MCP replaces entirely |
+| `Export-ExecutionPlan.ps1` | Claude Code runs `SET SHOWPLAN_XML ON` via MCP | **No** — MCP replaces entirely |
+| `Test-SpChange.ps1` | **Keep** — executes SPs with real params; regression diff needs before/after snapshots | **Yes** — still needed for validation |
+
+### Enabling MCP
+
+The NeoGov cc-templates include a pre-configured `microsoft-sql` MCP server (disabled by default).
+
+```bash
+# Check if MCP is configured
+claude mcp list
+
+# If microsoft-sql is listed but disabled, enable it:
+# Edit ~/.claude.json and set "disabled": false for microsoft-sql
+```
+
+Alternatively, add the SQL Server MCP server directly:
+
+```bash
+claude mcp add --transport stdio microsoft-sql -- \
+  npx -y @anthropic/mcp-server-sql-server \
+  --connection-string "Server=localhost;Database=AttractDB;Trusted_Connection=True"
+```
+
+### MCP Workflow (replaces Stages 1.1–1.3)
+
+With MCP enabled, skip the PowerShell export steps entirely:
+
+```bash
+# 1. Install commands (still needed)
+./scripts/install.sh /path/to/your-dotnet-project
+
+# 2. Navigate and start Claude Code
+cd /path/to/your-dotnet-project
+claude
+
+# 3. Build registry — /sp-discover now queries DB directly via MCP
+/sp-discover src
+
+# 4. Analyze — /sp-analyze uses MCP for live metadata, params, dependencies
+/sp-analyze DataSync.GetJobsForSync
+```
+
+Claude Code will automatically detect the MCP server and use it for:
+- Fetching SP definitions (`OBJECT_DEFINITION()`)
+- Querying parameters and dependencies (`sys.parameters`, `sys.sql_expression_dependencies`)
+- Retrieving runtime stats (`sys.dm_exec_procedure_stats`)
+- Generating execution plans (`SET SHOWPLAN_XML ON`)
+
+### When to Keep PowerShell Scripts
+
+| Scenario | Use |
+|----------|-----|
+| MCP not available (policy restriction, no DB access from dev machine) | PowerShell scripts |
+| Before/after regression testing | `Test-SpChange.ps1` (always) |
+| CI/CD integration (export on merge) | PowerShell scripts |
+| Offline analysis (disconnected from DB) | PowerShell exports |
+
+### MCP + PowerShell Together
+
+The two approaches are complementary:
+1. **MCP for live exploration**: Real-time queries during analysis sessions
+2. **PowerShell for snapshots**: Deterministic exports committed to Git for version tracking and offline use
+3. **Test-SpChange.ps1 always**: Before/after regression validation regardless of MCP status
+
+---
+
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| SP definition not found | Run `Export-SpDefinitions.ps1` or check repo path |
+| SP definition not found | Run `Export-SpDefinitions.ps1` or check repo path. With MCP, Claude Code fetches directly. |
 | No .NET references found | Check search patterns — may use constants or enums for SP names |
 | PowerShell scripts fail to connect | Verify connection string, check firewall, try with `-Credential` |
+| Azure SQL connection refused | Add `-UseAzureAD` flag. Requires `SqlServer` module: `Install-Module SqlServer -Scope CurrentUser` |
+| `System.Data.SqlClient` not found | Install SqlServer module for `Microsoft.Data.SqlClient`: `Install-Module SqlServer -Scope CurrentUser` |
+| MCP server not connecting | Check `claude mcp list`. Verify connection string in `~/.claude.json`. Restart Claude Code after config change. |
 | Metadata export slow | Filter by SP name or schema to reduce scope |
-| Execution plan empty | SP may use dynamic SQL — try with actual parameters |
+| Execution plan empty | SP may use dynamic SQL — try with actual parameters. Requires `SHOWPLAN` permission. |
 | Diff shows unexpected changes | Check if other SP changes were deployed between before/after |

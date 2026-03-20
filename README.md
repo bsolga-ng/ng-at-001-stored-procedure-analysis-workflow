@@ -26,10 +26,12 @@ Legacy codebases accumulate undocumented stored procedures — inherited through
 ## Quick Start
 
 1. **Install the tooling** in your target repository (see [Installation](#installation))
-2. **Run `/sp-discover`** to build your SP registry
-3. **Pick the SP** you need to work on
-4. **Run `/sp-analyze {sp-name}`** for full analysis
-5. **Review** generated documentation, assess blast radius, proceed with change
+2. **Trace from the UI**: Open the app → Developer Tools → Network tab → identify the API call → search for that endpoint in the .NET backend
+3. **Run `/sp-analyze {sp-name}`** — blast radius is shown first, then full analysis
+4. **Review** the blast radius (who calls this SP), then logic details
+5. **Run `/sp-change-prep {sp-name}`** before making any modifications
+
+> **Blast radius is the priority output.** Even a simple fix can have huge downstream impact. The workflow shows blast radius before logic details so you know the impact before you change anything.
 
 ---
 
@@ -73,26 +75,62 @@ Start Claude Code in your project and ask:
 
 ---
 
-## PowerShell Scripts (Database Bridge)
+## Database Access
 
-Claude Code cannot connect to databases. These PowerShell scripts bridge the gap by extracting deterministic data from SQL Server that Claude Code can then analyze.
+### Option A: Local QA Backup (Recommended for Pilot)
 
-| Script | Purpose | Requires DB Access |
+Restore a database backup from QA locally. This is the standard approach for the pilot — no need to connect to live QA environments.
+
+```bash
+# Restore QA backup to local SQL Server
+sqlcmd -S localhost -Q "RESTORE DATABASE AttractDB FROM DISK = '/path/to/attract-qa-backup.bak'"
+```
+
+Then connect via MCP or PowerShell scripts using the local connection string.
+
+### Option B: SQL Server MCP (Recommended for Live Analysis)
+
+If the `microsoft-sql` MCP server is enabled, Claude Code queries the database directly — no PowerShell scripts needed for exploration.
+
+```bash
+# Enable the MCP server (if using cc-templates)
+# Edit ~/.claude.json → set microsoft-sql "disabled": false
+
+# Or add directly
+claude mcp add --transport stdio microsoft-sql -- \
+  npx -y @anthropic/mcp-server-sql-server \
+  --connection-string "Server=localhost;Database=AttractDB;Trusted_Connection=True"
+```
+
+With MCP, `/sp-discover` and `/sp-analyze` fetch SP definitions, metadata, and stats live from the database.
+
+### Option B: PowerShell Scripts (Database Bridge)
+
+For environments where MCP is unavailable, PowerShell scripts export data to files that Claude Code analyzes.
+
+| Script | Purpose | Replaced by MCP? |
 |--------|---------|-------------------|
-| `Export-SpDefinitions.ps1` | Export all SP definitions to .sql files | Yes |
-| `Export-SpMetadata.ps1` | Export SP parameters, dependencies, table references | Yes |
-| `Export-ExecutionPlan.ps1` | Capture execution plan for a given SP + parameters | Yes |
-| `Test-SpChange.ps1` | Run SP before/after with same params, diff results | Yes |
-| `Get-SpStats.ps1` | Export runtime stats (execution count, avg duration) | Yes |
+| `Export-SpDefinitions.ps1` | Export SP definitions to .sql files | Yes |
+| `Export-SpMetadata.ps1` | Export parameters, dependencies, indexes | Yes |
+| `Export-ExecutionPlan.ps1` | Capture execution plan XML + summary | Yes |
+| `Get-SpStats.ps1` | Export runtime stats from DMVs | Yes |
+| `Test-SpChange.ps1` | Before/after regression diff | **No — always needed** |
 
-**Two usage modes:**
+All scripts support:
+- **Windows Integrated auth** (default)
+- **SQL auth** (`-Credential`)
+- **Azure AD auth** (`-UseAzureAD`, requires `SqlServer` module)
+- **Microsoft.Data.SqlClient** (preferred) with **System.Data.SqlClient** fallback
+
+**Three usage modes:**
 
 | Mode | How | When |
 |------|-----|------|
-| **Manual** | Developer runs PowerShell scripts, feeds output files to Claude Code | No shell access to DB from Claude Code |
-| **Integrated** | Claude Code invokes scripts via `pwsh` (if PowerShell Core installed) | Full automation |
+| **MCP** | Claude Code queries DB directly via MCP server | MCP available, real-time analysis |
+| **Integrated** | Claude Code invokes scripts via `pwsh` | MCP unavailable, PowerShell Core installed |
+| **Manual** | Developer runs scripts, feeds output files to Claude Code | Offline or restricted environments |
 
-See [PowerShell Scripts Guide](docs/powershell-scripts.md) for details.
+See [Playbook](docs/playbook.md) for detailed setup of each mode.
 
 ---
 

@@ -25,9 +25,13 @@
 .PARAMETER Credential
     Optional: SQL auth credential
 
+.PARAMETER UseAzureAD
+    Switch: Use Azure AD Interactive authentication (for Azure SQL)
+
 .EXAMPLE
     .\Export-SpMetadata.ps1 -ServerInstance "localhost" -Database "AttractDB"
     .\Export-SpMetadata.ps1 -ServerInstance "localhost" -Database "AttractDB" -SpName "DataSync.GetJobsForSync"
+    .\Export-SpMetadata.ps1 -ServerInstance "server.database.windows.net" -Database "AttractDB" -UseAzureAD
 #>
 
 [CmdletBinding()]
@@ -42,32 +46,54 @@ param(
 
     [string]$OutputDir = "docs/sp-metadata",
 
-    [PSCredential]$Credential
+    [PSCredential]$Credential,
+
+    [switch]$UseAzureAD
 )
 
 $ErrorActionPreference = "Stop"
 
-# Build connection string
-$connStringBuilder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
-$connStringBuilder["Data Source"] = $ServerInstance
-$connStringBuilder["Initial Catalog"] = $Database
-
-if ($Credential) {
-    $connStringBuilder["User ID"] = $Credential.UserName
-    $connStringBuilder["Password"] = $Credential.GetNetworkCredential().Password
-} else {
-    $connStringBuilder["Integrated Security"] = $true
+# Prefer Microsoft.Data.SqlClient; fall back to System.Data.SqlClient
+$useMds = $false
+try {
+    Import-Module SqlServer -ErrorAction SilentlyContinue
+    [void][Microsoft.Data.SqlClient.SqlConnection]
+    $useMds = $true
+} catch {
+    try {
+        [void][System.Data.SqlClient.SqlConnection]
+    } catch {
+        Write-Error "No SQL client library found. Install the SqlServer module: Install-Module SqlServer -Scope CurrentUser"
+        return
+    }
 }
 
-function Invoke-Query {
-    param([string]$Query, [string]$ConnString)
-    $conn = New-Object System.Data.SqlClient.SqlConnection($ConnString)
+function New-SqlConnection {
+    param([string]$ConnString)
+    if ($useMds) { return [Microsoft.Data.SqlClient.SqlConnection]::new($ConnString) }
+    else { return [System.Data.SqlClient.SqlConnection]::new($ConnString) }
+}
+
+function Invoke-ParameterizedQuery {
+    param(
+        [string]$ConnString,
+        [string]$Query,
+        [hashtable]$Parameters = @{}
+    )
+    $conn = New-SqlConnection -ConnString $ConnString
     $conn.Open()
     try {
-        $cmd = $conn.CreateCommand()
-        $cmd.CommandText = $Query
+        if ($useMds) {
+            $cmd = [Microsoft.Data.SqlClient.SqlCommand]::new($Query, $conn)
+            $adapter = [Microsoft.Data.SqlClient.SqlDataAdapter]::new($cmd)
+        } else {
+            $cmd = [System.Data.SqlClient.SqlCommand]::new($Query, $conn)
+            $adapter = [System.Data.SqlClient.SqlDataAdapter]::new($cmd)
+        }
         $cmd.CommandTimeout = 120
-        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+        foreach ($p in $Parameters.GetEnumerator()) {
+            $cmd.Parameters.AddWithValue($p.Key, $p.Value) | Out-Null
+        }
         $table = New-Object System.Data.DataTable
         $adapter.Fill($table) | Out-Null
         return $table
@@ -76,38 +102,65 @@ function Invoke-Query {
     }
 }
 
-$connString = $connStringBuilder.ToString()
-New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+# Build connection string
+$connParts = @(
+    "Data Source=$ServerInstance",
+    "Initial Catalog=$Database"
+)
 
-# Get SP list
-$spFilter = ""
-if ($SpName) {
-    if ($SpName -match '\.') {
-        $parts = $SpName -split '\.'
-        $spFilter = "AND s.name = '$($parts[0])' AND p.name LIKE '$($parts[1].Replace('*','%'))'"
+if ($UseAzureAD) {
+    if ($useMds) {
+        $connParts += "Authentication=Active Directory Interactive"
+        $connParts += "Encrypt=True"
     } else {
-        $spFilter = "AND p.name LIKE '$($SpName.Replace('*','%'))'"
+        Write-Error "Azure AD auth requires Microsoft.Data.SqlClient. Install the SqlServer module: Install-Module SqlServer -Scope CurrentUser"
+        return
     }
+} elseif ($Credential) {
+    $connParts += "User ID=$($Credential.UserName)"
+    $connParts += "Password=$($Credential.GetNetworkCredential().Password)"
+    if ($ServerInstance -match '\.database\.windows\.net') { $connParts += "Encrypt=True" }
+} else {
+    $connParts += "Integrated Security=True"
 }
 
-$spList = Invoke-Query -ConnString $connString -Query @"
+$connString = $connParts -join ";"
+New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+
+# Get SP list with parameterized filter
+$spQuery = @"
 SELECT s.name AS [Schema], p.name AS [Name], p.object_id
 FROM sys.procedures p
 JOIN sys.schemas s ON p.schema_id = s.schema_id
-WHERE 1=1 $spFilter
-ORDER BY s.name, p.name
+WHERE 1=1
 "@
+
+$spParams = @{}
+if ($SpName) {
+    if ($SpName -match '\.') {
+        $parts = $SpName -split '\.'
+        $spQuery += " AND s.name = @SchemaFilter AND p.name LIKE @NameFilter"
+        $spParams["@SchemaFilter"] = $parts[0]
+        $spParams["@NameFilter"] = $parts[1].Replace('*', '%')
+    } else {
+        $spQuery += " AND p.name LIKE @NameFilter"
+        $spParams["@NameFilter"] = $SpName.Replace('*', '%')
+    }
+}
+$spQuery += " ORDER BY s.name, p.name"
+
+$spList = Invoke-ParameterizedQuery -ConnString $connString -Query $spQuery -Parameters $spParams
 
 $allMetadata = @()
 
 foreach ($sp in $spList.Rows) {
-    $schema = $sp.Schema
+    $schemaVal = $sp.Schema
     $name = $sp.Name
-    $objectId = $sp.object_id
-    Write-Host "Processing: $schema.$name" -ForegroundColor Yellow
+    $objectId = [int]$sp.object_id
+    Write-Host "Processing: $schemaVal.$name" -ForegroundColor Yellow
 
     # Parameters
-    $params = Invoke-Query -ConnString $connString -Query @"
+    $params = Invoke-ParameterizedQuery -ConnString $connString -Query @"
 SELECT
     par.name AS [Name],
     TYPE_NAME(par.user_type_id) AS [Type],
@@ -118,12 +171,12 @@ SELECT
     par.has_default_value AS [HasDefault],
     par.default_value AS [DefaultValue]
 FROM sys.parameters par
-WHERE par.object_id = $objectId
+WHERE par.object_id = @ObjectId
 ORDER BY par.parameter_id
-"@
+"@ -Parameters @{ "@ObjectId" = $objectId }
 
     # Table/View dependencies
-    $dependencies = Invoke-Query -ConnString $connString -Query @"
+    $dependencies = Invoke-ParameterizedQuery -ConnString $connString -Query @"
 SELECT DISTINCT
     COALESCE(d.referenced_schema_name, 'dbo') AS [Schema],
     d.referenced_entity_name AS [Name],
@@ -131,30 +184,44 @@ SELECT DISTINCT
 FROM sys.sql_expression_dependencies d
 LEFT JOIN sys.objects o ON o.name = d.referenced_entity_name
     AND o.schema_id = SCHEMA_ID(COALESCE(d.referenced_schema_name, 'dbo'))
-WHERE d.referencing_id = $objectId
+WHERE d.referencing_id = @ObjectId
     AND d.referenced_entity_name IS NOT NULL
 ORDER BY d.referenced_entity_name
-"@
+"@ -Parameters @{ "@ObjectId" = $objectId }
 
     # Cross-SP dependencies (SPs that call this SP)
-    $callers = Invoke-Query -ConnString $connString -Query @"
+    $callers = Invoke-ParameterizedQuery -ConnString $connString -Query @"
 SELECT DISTINCT
     SCHEMA_NAME(o.schema_id) AS [CallerSchema],
     o.name AS [CallerName],
     o.type_desc AS [CallerType]
 FROM sys.sql_expression_dependencies d
 JOIN sys.objects o ON o.object_id = d.referencing_id
-WHERE d.referenced_entity_name = '$name'
-    AND COALESCE(d.referenced_schema_name, 'dbo') = '$schema'
-    AND o.object_id != $objectId
+WHERE d.referenced_entity_name = @SpName
+    AND COALESCE(d.referenced_schema_name, 'dbo') = @SchemaName
+    AND o.object_id != @ObjectId
 ORDER BY o.name
-"@
+"@ -Parameters @{
+        "@SpName" = $name
+        "@SchemaName" = $schemaVal
+        "@ObjectId" = $objectId
+    }
 
     # Index info for referenced tables
-    $tableNames = ($dependencies.Rows | Where-Object { $_.Type -match 'TABLE' } | ForEach-Object { "'$($_.Name)'" }) -join ','
+    $tableNames = @($dependencies.Rows | Where-Object { $_.Type -match 'TABLE' } | ForEach-Object { $_.Name })
     $indexes = @()
-    if ($tableNames) {
-        $indexes = Invoke-Query -ConnString $connString -Query @"
+    if ($tableNames.Count -gt 0) {
+        # Build parameterized IN clause
+        $inParams = @{}
+        $inPlaceholders = @()
+        for ($i = 0; $i -lt $tableNames.Count; $i++) {
+            $paramName = "@Table$i"
+            $inParams[$paramName] = $tableNames[$i]
+            $inPlaceholders += $paramName
+        }
+        $inClause = $inPlaceholders -join ','
+
+        $indexes = Invoke-ParameterizedQuery -ConnString $connString -Query @"
 SELECT
     OBJECT_NAME(i.object_id) AS [Table],
     i.name AS [IndexName],
@@ -163,15 +230,15 @@ SELECT
 FROM sys.indexes i
 JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
 JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-WHERE OBJECT_NAME(i.object_id) IN ($tableNames)
+WHERE OBJECT_NAME(i.object_id) IN ($inClause)
     AND i.name IS NOT NULL
 GROUP BY i.object_id, i.name, i.type_desc
 ORDER BY OBJECT_NAME(i.object_id), i.name
-"@
+"@ -Parameters $inParams
     }
 
     $spMetadata = [PSCustomObject]@{
-        Schema       = $schema
+        Schema       = $schemaVal
         Name         = $name
         Parameters   = @($params.Rows | ForEach-Object {
             [PSCustomObject]@{

@@ -22,9 +22,13 @@
 .PARAMETER Credential
     Optional: SQL auth credential
 
+.PARAMETER UseAzureAD
+    Switch: Use Azure AD Interactive authentication (for Azure SQL)
+
 .EXAMPLE
     .\Get-SpStats.ps1 -ServerInstance "localhost" -Database "AttractDB"
     .\Get-SpStats.ps1 -ServerInstance "localhost" -Database "AttractDB" -TopN 20
+    .\Get-SpStats.ps1 -ServerInstance "server.database.windows.net" -Database "AttractDB" -UseAzureAD
 #>
 
 [CmdletBinding()]
@@ -39,27 +43,62 @@ param(
 
     [string]$OutputDir = "docs/sp-metadata",
 
-    [PSCredential]$Credential
+    [PSCredential]$Credential,
+
+    [switch]$UseAzureAD
 )
 
 $ErrorActionPreference = "Stop"
 
-$connStringBuilder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
-$connStringBuilder["Data Source"] = $ServerInstance
-$connStringBuilder["Initial Catalog"] = $Database
-
-if ($Credential) {
-    $connStringBuilder["User ID"] = $Credential.UserName
-    $connStringBuilder["Password"] = $Credential.GetNetworkCredential().Password
-} else {
-    $connStringBuilder["Integrated Security"] = $true
+# Prefer Microsoft.Data.SqlClient; fall back to System.Data.SqlClient
+$useMds = $false
+try {
+    Import-Module SqlServer -ErrorAction SilentlyContinue
+    [void][Microsoft.Data.SqlClient.SqlConnection]
+    $useMds = $true
+} catch {
+    try {
+        [void][System.Data.SqlClient.SqlConnection]
+    } catch {
+        Write-Error "No SQL client library found. Install the SqlServer module: Install-Module SqlServer -Scope CurrentUser"
+        return
+    }
 }
 
-$connString = $connStringBuilder.ToString()
+function New-SqlConnection {
+    param([string]$ConnString)
+    if ($useMds) { return [Microsoft.Data.SqlClient.SqlConnection]::new($ConnString) }
+    else { return [System.Data.SqlClient.SqlConnection]::new($ConnString) }
+}
+
+# Build connection string
+$connParts = @(
+    "Data Source=$ServerInstance",
+    "Initial Catalog=$Database"
+)
+
+if ($UseAzureAD) {
+    if ($useMds) {
+        $connParts += "Authentication=Active Directory Interactive"
+        $connParts += "Encrypt=True"
+    } else {
+        Write-Error "Azure AD auth requires Microsoft.Data.SqlClient. Install the SqlServer module: Install-Module SqlServer -Scope CurrentUser"
+        return
+    }
+} elseif ($Credential) {
+    $connParts += "User ID=$($Credential.UserName)"
+    $connParts += "Password=$($Credential.GetNetworkCredential().Password)"
+    if ($ServerInstance -match '\.database\.windows\.net') { $connParts += "Encrypt=True" }
+} else {
+    $connParts += "Integrated Security=True"
+}
+
+$connString = $connParts -join ";"
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
+# Parameterized query — TopN is [int] typed so safe to interpolate, but Database uses a param
 $query = @"
-SELECT TOP $TopN
+SELECT TOP (@TopN)
     DB_NAME(ps.database_id) AS [Database],
     SCHEMA_NAME(o.schema_id) AS [Schema],
     o.name AS [SPName],
@@ -77,17 +116,24 @@ SELECT TOP $TopN
     ps.cached_time AS [CachedSince]
 FROM sys.dm_exec_procedure_stats ps
 JOIN sys.objects o ON ps.object_id = o.object_id
-WHERE ps.database_id = DB_ID('$Database')
+WHERE ps.database_id = DB_ID(@DatabaseName)
 ORDER BY ps.total_elapsed_time DESC
 "@
 
-$conn = New-Object System.Data.SqlClient.SqlConnection($connString)
+$conn = New-SqlConnection -ConnString $connString
 $conn.Open()
 try {
-    $cmd = $conn.CreateCommand()
-    $cmd.CommandText = $query
+    if ($useMds) {
+        $cmd = [Microsoft.Data.SqlClient.SqlCommand]::new($query, $conn)
+        $adapter = [Microsoft.Data.SqlClient.SqlDataAdapter]::new($cmd)
+    } else {
+        $cmd = [System.Data.SqlClient.SqlCommand]::new($query, $conn)
+        $adapter = [System.Data.SqlClient.SqlDataAdapter]::new($cmd)
+    }
     $cmd.CommandTimeout = 120
-    $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+    $cmd.Parameters.AddWithValue("@TopN", $TopN) | Out-Null
+    $cmd.Parameters.AddWithValue("@DatabaseName", $Database) | Out-Null
+
     $table = New-Object System.Data.DataTable
     $adapter.Fill($table) | Out-Null
 

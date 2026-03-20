@@ -33,6 +33,12 @@
 .PARAMETER Credential
     Optional: SQL auth credential
 
+.PARAMETER UseAzureAD
+    Switch: Use Azure AD Interactive authentication (for Azure SQL)
+
+.PARAMETER CommandTimeout
+    Timeout in seconds for SP execution (default: 300)
+
 .EXAMPLE
     $params = @{ JobId = 123 }
 
@@ -45,6 +51,10 @@
     # After the change
     .\Test-SpChange.ps1 -ServerInstance "localhost" -Database "AttractDB" `
         -SpName "DataSync.GetJobsForSync" -Parameters $params -Phase "after"
+
+    # Azure SQL with longer timeout
+    .\Test-SpChange.ps1 -ServerInstance "server.database.windows.net" -Database "AttractDB" `
+        -SpName "DataSync.GetJobsForSync" -Parameters $params -Phase "before" -UseAzureAD -CommandTimeout 600
 #>
 
 [CmdletBinding()]
@@ -66,36 +76,77 @@ param(
 
     [string]$OutputDir = "docs/sp-analysis/validation",
 
-    [PSCredential]$Credential
+    [PSCredential]$Credential,
+
+    [switch]$UseAzureAD,
+
+    [int]$CommandTimeout = 300
 )
 
 $ErrorActionPreference = "Stop"
 
-$connStringBuilder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
-$connStringBuilder["Data Source"] = $ServerInstance
-$connStringBuilder["Initial Catalog"] = $Database
-
-if ($Credential) {
-    $connStringBuilder["User ID"] = $Credential.UserName
-    $connStringBuilder["Password"] = $Credential.GetNetworkCredential().Password
-} else {
-    $connStringBuilder["Integrated Security"] = $true
+# Prefer Microsoft.Data.SqlClient; fall back to System.Data.SqlClient
+$useMds = $false
+try {
+    Import-Module SqlServer -ErrorAction SilentlyContinue
+    [void][Microsoft.Data.SqlClient.SqlConnection]
+    $useMds = $true
+} catch {
+    try {
+        [void][System.Data.SqlClient.SqlConnection]
+    } catch {
+        Write-Error "No SQL client library found. Install the SqlServer module: Install-Module SqlServer -Scope CurrentUser"
+        return
+    }
 }
 
-$connString = $connStringBuilder.ToString()
+function New-SqlConnection {
+    param([string]$ConnString)
+    if ($useMds) { return [Microsoft.Data.SqlClient.SqlConnection]::new($ConnString) }
+    else { return [System.Data.SqlClient.SqlConnection]::new($ConnString) }
+}
+
+# Build connection string
+$connParts = @(
+    "Data Source=$ServerInstance",
+    "Initial Catalog=$Database"
+)
+
+if ($UseAzureAD) {
+    if ($useMds) {
+        $connParts += "Authentication=Active Directory Interactive"
+        $connParts += "Encrypt=True"
+    } else {
+        Write-Error "Azure AD auth requires Microsoft.Data.SqlClient. Install the SqlServer module: Install-Module SqlServer -Scope CurrentUser"
+        return
+    }
+} elseif ($Credential) {
+    $connParts += "User ID=$($Credential.UserName)"
+    $connParts += "Password=$($Credential.GetNetworkCredential().Password)"
+    if ($ServerInstance -match '\.database\.windows\.net') { $connParts += "Encrypt=True" }
+} else {
+    $connParts += "Integrated Security=True"
+}
+
+$connString = $connParts -join ";"
 $safeName = $SpName -replace '\.', '_'
 $spOutputDir = Join-Path $OutputDir $safeName
 New-Item -ItemType Directory -Path $spOutputDir -Force | Out-Null
 
-$connection = New-Object System.Data.SqlClient.SqlConnection($connString)
+$connection = New-SqlConnection -ConnString $connString
 $connection.Open()
 
 try {
-    # Build command
-    $cmd = $connection.CreateCommand()
-    $cmd.CommandText = $SpName
+    # Build command using CommandType.StoredProcedure with proper parameters
+    if ($useMds) {
+        $cmd = [Microsoft.Data.SqlClient.SqlCommand]::new($SpName, $connection)
+        $adapter = [Microsoft.Data.SqlClient.SqlDataAdapter]::new($cmd)
+    } else {
+        $cmd = [System.Data.SqlClient.SqlCommand]::new($SpName, $connection)
+        $adapter = [System.Data.SqlClient.SqlDataAdapter]::new($cmd)
+    }
     $cmd.CommandType = [System.Data.CommandType]::StoredProcedure
-    $cmd.CommandTimeout = 300
+    $cmd.CommandTimeout = $CommandTimeout
 
     foreach ($p in $Parameters.GetEnumerator()) {
         $cmd.Parameters.AddWithValue("@$($p.Key)", $p.Value) | Out-Null
@@ -103,7 +154,6 @@ try {
 
     # Execute and capture
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
     $dataSet = New-Object System.Data.DataSet
     $adapter.Fill($dataSet) | Out-Null
     $stopwatch.Stop()

@@ -25,6 +25,9 @@
 .PARAMETER Credential
     Optional: SQL Server credential. If omitted, uses Windows/Integrated auth.
 
+.PARAMETER UseAzureAD
+    Switch: Use Azure AD Interactive authentication (for Azure SQL)
+
 .EXAMPLE
     # Export all SPs
     .\Export-SpDefinitions.ps1 -ServerInstance "localhost" -Database "AttractDB"
@@ -38,6 +41,9 @@
     # Azure SQL with credential
     $cred = Get-Credential
     .\Export-SpDefinitions.ps1 -ServerInstance "server.database.windows.net" -Database "AttractDB" -Credential $cred
+
+    # Azure SQL with AAD
+    .\Export-SpDefinitions.ps1 -ServerInstance "server.database.windows.net" -Database "AttractDB" -UseAzureAD
 #>
 
 [CmdletBinding()]
@@ -54,26 +60,70 @@ param(
 
     [string]$OutputDir = "docs/sp-definitions",
 
-    [PSCredential]$Credential
+    [PSCredential]$Credential,
+
+    [switch]$UseAzureAD
 )
 
 $ErrorActionPreference = "Stop"
 
-# Build connection string
-$connStringBuilder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
-$connStringBuilder["Data Source"] = $ServerInstance
-$connStringBuilder["Initial Catalog"] = $Database
-
-if ($Credential) {
-    $connStringBuilder["User ID"] = $Credential.UserName
-    $connStringBuilder["Password"] = $Credential.GetNetworkCredential().Password
-} else {
-    $connStringBuilder["Integrated Security"] = $true
+# Prefer Microsoft.Data.SqlClient; fall back to System.Data.SqlClient
+$useMds = $false
+try {
+    Import-Module SqlServer -ErrorAction SilentlyContinue
+    [void][Microsoft.Data.SqlClient.SqlConnection]
+    $useMds = $true
+} catch {
+    try {
+        [void][System.Data.SqlClient.SqlConnection]
+    } catch {
+        Write-Error "No SQL client library found. Install the SqlServer module: Install-Module SqlServer -Scope CurrentUser"
+        return
+    }
 }
 
-$connString = $connStringBuilder.ToString()
+function New-SqlConnection {
+    param([string]$ConnString)
+    if ($useMds) { return [Microsoft.Data.SqlClient.SqlConnection]::new($ConnString) }
+    else { return [System.Data.SqlClient.SqlConnection]::new($ConnString) }
+}
 
-# Build query
+function New-SqlCommand {
+    param([string]$Text, $Connection)
+    if ($useMds) {
+        $cmd = [Microsoft.Data.SqlClient.SqlCommand]::new($Text, $Connection)
+    } else {
+        $cmd = [System.Data.SqlClient.SqlCommand]::new($Text, $Connection)
+    }
+    $cmd.CommandTimeout = 120
+    return $cmd
+}
+
+# Build connection string
+$connParts = @(
+    "Data Source=$ServerInstance",
+    "Initial Catalog=$Database"
+)
+
+if ($UseAzureAD) {
+    if ($useMds) {
+        $connParts += "Authentication=Active Directory Interactive"
+        $connParts += "Encrypt=True"
+    } else {
+        Write-Error "Azure AD auth requires Microsoft.Data.SqlClient. Install the SqlServer module: Install-Module SqlServer -Scope CurrentUser"
+        return
+    }
+} elseif ($Credential) {
+    $connParts += "User ID=$($Credential.UserName)"
+    $connParts += "Password=$($Credential.GetNetworkCredential().Password)"
+    if ($ServerInstance -match '\.database\.windows\.net') { $connParts += "Encrypt=True" }
+} else {
+    $connParts += "Integrated Security=True"
+}
+
+$connString = $connParts -join ";"
+
+# Build parameterized query
 $query = @"
 SELECT
     s.name AS [Schema],
@@ -87,17 +137,23 @@ JOIN sys.schemas s ON p.schema_id = s.schema_id
 WHERE 1=1
 "@
 
+$sqlParams = @{}
+
 if ($SpName) {
     if ($SpName -match '\.') {
         $parts = $SpName -split '\.'
-        $query += "`n    AND s.name = '$($parts[0])' AND p.name LIKE '$($parts[1].Replace('*','%'))'"
+        $query += "`n    AND s.name = @SchemaFilter AND p.name LIKE @NameFilter"
+        $sqlParams["@SchemaFilter"] = $parts[0]
+        $sqlParams["@NameFilter"] = $parts[1].Replace('*', '%')
     } else {
-        $query += "`n    AND p.name LIKE '$($SpName.Replace('*','%'))'"
+        $query += "`n    AND p.name LIKE @NameFilter"
+        $sqlParams["@NameFilter"] = $SpName.Replace('*', '%')
     }
 }
 
 if ($Schema) {
-    $query += "`n    AND s.name = '$Schema'"
+    $query += "`n    AND s.name = @SchemaParam"
+    $sqlParams["@SchemaParam"] = $Schema
 }
 
 $query += "`nORDER BY s.name, p.name"
@@ -106,20 +162,21 @@ $query += "`nORDER BY s.name, p.name"
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 # Connect and export
-$connection = New-Object System.Data.SqlClient.SqlConnection($connString)
+$connection = New-SqlConnection -ConnString $connString
 $connection.Open()
 
 try {
-    $command = $connection.CreateCommand()
-    $command.CommandText = $query
-    $command.CommandTimeout = 120
+    $command = New-SqlCommand -Text $query -Connection $connection
+    foreach ($p in $sqlParams.GetEnumerator()) {
+        $command.Parameters.AddWithValue($p.Key, $p.Value) | Out-Null
+    }
     $reader = $command.ExecuteReader()
 
     $count = 0
     $manifest = @()
 
     while ($reader.Read()) {
-        $schema = $reader["Schema"]
+        $schemaVal = $reader["Schema"]
         $name = $reader["Name"]
         $definition = $reader["Definition"]
         $created = $reader["Created"]
@@ -127,7 +184,7 @@ try {
         $paramCount = $reader["ParamCount"]
 
         # Create schema subdirectory
-        $schemaDir = Join-Path $OutputDir $schema
+        $schemaDir = Join-Path $OutputDir $schemaVal
         New-Item -ItemType Directory -Path $schemaDir -Force | Out-Null
 
         # Write SP definition
@@ -135,7 +192,7 @@ try {
         $definition | Out-File -FilePath $filePath -Encoding utf8
 
         $manifest += [PSCustomObject]@{
-            Schema    = $schema
+            Schema    = $schemaVal
             Name      = $name
             File      = $filePath
             Created   = $created
@@ -145,7 +202,7 @@ try {
         }
 
         $count++
-        Write-Host "  Exported: $schema.$name ($paramCount params, $(($definition -split "`n").Count) lines)" -ForegroundColor Green
+        Write-Host "  Exported: $schemaVal.$name ($paramCount params, $(($definition -split "`n").Count) lines)" -ForegroundColor Green
     }
 
     $reader.Close()
