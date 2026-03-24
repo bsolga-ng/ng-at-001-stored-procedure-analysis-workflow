@@ -11,6 +11,8 @@ Welcome to the Stored Procedure Analysis workflow. This guide walks you through 
 
 ## Instructions
 
+**First**: Read `CLAUDE.md` in the repository root to load the workflow context — target stack, skills, key principles, database access modes, and output locations.
+
 Present this information interactively, adapting to the developer's experience level.
 
 ### Introduction
