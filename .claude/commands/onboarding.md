@@ -43,11 +43,14 @@ This top-down flow (UI → API → Backend → SP) is how most SP work starts. T
 
 | What You Say | What Activates |
 |-------------|----------------|
+| "I need to fix SP X, it has issue Y — work with me" | **SP Quick Fix** — guided step-by-step fixing |
 | "I'm looking at this API endpoint, what SP does it call?" | SP Discovery — traces endpoint to SP |
 | "What SPs does this codebase use?" | SP Discovery — builds a registry of all SP references |
 | "What's the blast radius of Recruitment.GetCandidateList?" | SP Analysis — blast radius first, then full analysis |
 | "What does this SP do?" | SP Analysis — full analysis with blast radius and docs |
 | "I need to change this SP" | SP Change Prep — impact analysis + validation scripts |
+| "Give me sample data to test this SP" | **SP Test Data** — realistic parameters + test script |
+| "I'm new — how do I try this out safely?" | **SP Test Data** (onboarding mode) — safe experimentation guide |
 | "Document this SP" | SP Documentation — generate docs or coverage report |
 
 You don't need to remember command names. Just describe what you need and the right skill activates.
@@ -117,12 +120,14 @@ Present the typical developer workflow:
 Offer to demonstrate:
 
 "Would you like me to:
-1. **See an example analysis** — [Recruitment.GetCandidateList](../../docs/examples/Recruitment.GetCandidateList.md) (710-line XL SP, blast radius + full logic)
-2. **Check your setup** — detect MCP, PowerShell, SP definitions, and recommend next steps
-3. **Run discovery** on your codebase to find all SP references
-4. **Analyze a specific SP** you're working on right now
-5. **Show the PowerShell scripts** for database interaction (if MCP is unavailable)
-6. **Just show the skill list** and let you explore on your own"
+1. **Fix an SP issue now** — 'I need to fix SP X, it has issue Y' → guided step-by-step (Quick Fix mode)
+2. **See an example analysis** — [Recruitment.GetCandidateList](../../docs/examples/Recruitment.GetCandidateList.md) (710-line XL SP, blast radius + full logic)
+3. **Try it safely** — generate sample test data and a safe experimentation guide (great for new team members)
+4. **Check your setup** — detect MCP, PowerShell, SP definitions, and recommend next steps
+5. **Run discovery** on your codebase to find all SP references
+6. **Analyze a specific SP** you're working on right now
+7. **Show the PowerShell scripts** for database interaction (if MCP is unavailable)
+8. **Just show the skill list** and let you explore on your own"
 
 Proceed based on the developer's choice.
 
@@ -130,6 +135,8 @@ Proceed based on the developer's choice.
 
 | Skill | Triggers When | What It Does |
 |-------|---------------|-------------|
+| **SP Quick Fix** | "Fix SP X, issue Y — work with me" | Guided step-by-step: blast radius → locate problem → fix → test → validate |
+| **SP Test Data** | "Give me sample data" / "I'm new, how do I try this?" | Realistic parameter values, lookup queries, test scripts, safe experimentation guide |
 | SP Discovery | No SP registry exists; developer asks about SPs in codebase | Scans .NET code for ADO.NET/Dapper/EF patterns, builds registry |
 | SP Analysis | Developer asks about an SP, mentions modifying or debugging one | Parses logic, traces blast radius, generates Mermaid docs |
 | SP Change Prep | Developer intends to modify an SP | Impact analysis, validation scripts, change checklist |

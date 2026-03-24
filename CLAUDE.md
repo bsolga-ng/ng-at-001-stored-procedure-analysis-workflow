@@ -16,6 +16,8 @@ AI-powered workflow for understanding, documenting, and safely modifying legacy 
 
 | Skill | Triggers When |
 |-------|--------------|
+| `sp-quick-fix` | Developer says "fix SP X, issue Y — work with me" — guided step-by-step fixing |
+| `sp-test-data` | Developer wants sample data for testing, or is a new colleague onboarding |
 | `sp-analysis` | Developer asks about an SP, pastes SP name, or asks "what does X do?" |
 | `sp-discover` | Developer explores SP references or asks "what SPs does this codebase use?" |
 | `sp-change-prep` | Developer plans to modify an SP or asks about impact of a change |
