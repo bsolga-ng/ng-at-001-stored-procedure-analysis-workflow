@@ -38,15 +38,31 @@ echo "Merging permissions..."
 SETTINGS_FILE="$TARGET_DIR/.claude/settings.local.json"
 SOURCE_SETTINGS="$SCRIPT_DIR/.claude/settings.local.json"
 
-if [ -f "$SETTINGS_FILE" ]; then
+if [ ! -f "$SOURCE_SETTINGS" ]; then
+    echo "  Skipped: no source settings.local.json found"
+elif [ -f "$SETTINGS_FILE" ]; then
+    # Target already has settings — merge permissions additively
     if command -v python3 &>/dev/null; then
-        python3 -c "
+        python3 - "$SETTINGS_FILE" "$SOURCE_SETTINGS" << 'PYEOF'
 import json, sys
 
-with open('$SETTINGS_FILE') as f:
-    existing = json.load(f)
-with open('$SOURCE_SETTINGS') as f:
-    source = json.load(f)
+target_path = sys.argv[1]
+source_path = sys.argv[2]
+
+try:
+    with open(target_path) as f:
+        existing = json.load(f)
+except (json.JSONDecodeError, FileNotFoundError) as e:
+    print(f"  WARNING: Could not parse {target_path}: {e}")
+    print("  Skipping merge — existing settings.local.json left unchanged.")
+    sys.exit(0)
+
+try:
+    with open(source_path) as f:
+        source = json.load(f)
+except (json.JSONDecodeError, FileNotFoundError) as e:
+    print(f"  WARNING: Could not parse {source_path}: {e}")
+    sys.exit(0)
 
 existing_perms = set(existing.get('permissions', {}).get('allow', []))
 source_perms = set(source.get('permissions', {}).get('allow', []))
@@ -54,16 +70,37 @@ merged = sorted(existing_perms | source_perms)
 
 existing.setdefault('permissions', {})['allow'] = merged
 
-with open('$SETTINGS_FILE', 'w') as f:
+with open(target_path, 'w') as f:
     json.dump(existing, f, indent=2)
     f.write('\n')
+
+added = source_perms - existing_perms
+if added:
+    print(f"  Merged {len(added)} new permission(s): {', '.join(sorted(added))}")
+else:
+    print("  All permissions already present — no changes needed")
+PYEOF
+    elif command -v node &>/dev/null; then
+        # Fallback: use Node.js if python3 is unavailable (common on Windows)
+        node -e "
+const fs = require('fs');
+const target = JSON.parse(fs.readFileSync('$SETTINGS_FILE', 'utf8'));
+const source = JSON.parse(fs.readFileSync('$SOURCE_SETTINGS', 'utf8'));
+const existing = new Set(target.permissions?.allow || []);
+const toAdd = (source.permissions?.allow || []);
+toAdd.forEach(p => existing.add(p));
+if (!target.permissions) target.permissions = {};
+target.permissions.allow = [...existing].sort();
+fs.writeFileSync('$SETTINGS_FILE', JSON.stringify(target, null, 2) + '\n');
+console.log('  Merged permissions using Node.js');
 "
-        echo "  Merged permissions into existing settings.local.json"
     else
-        echo "  WARNING: python3 not found — cannot merge settings. Manual merge needed."
-        echo "  Source permissions: $SOURCE_SETTINGS"
+        echo "  WARNING: Neither python3 nor node found — cannot merge settings automatically."
+        echo "  Please manually add these permissions to $SETTINGS_FILE:"
+        cat "$SOURCE_SETTINGS"
     fi
 else
+    # No existing settings — just copy
     cp "$SOURCE_SETTINGS" "$SETTINGS_FILE"
     echo "  Installed settings.local.json"
 fi
